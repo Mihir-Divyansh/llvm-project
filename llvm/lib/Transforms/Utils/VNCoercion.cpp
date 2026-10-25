@@ -361,13 +361,25 @@ static Value *getStoreValueForLoadHelper(Value *SrcVal, unsigned Offset,
     ShiftAmt = (StoreSize - LoadSize - Offset) * 8;
 
   Type *SrcTy = SrcVal->getType();
-  // Integers drop provenance, and one poison bit poisons the whole value.
-  if (SrcTy->isByteOrByteVectorTy() ||
-      (SrcTy->isPtrOrPtrVectorTy() && LoadTy->isByteOrByteVectorTy())) {
+  // Integers drop provenance, and one poison bit poisons the whole value. A
+  // vector is only poisoned per lane, so it can't go through an integer either.
+  if (SrcTy->isVectorTy() || SrcTy->isByteTy() ||
+      (SrcTy->isPointerTy() && LoadTy->isByteOrByteVectorTy())) {
+    // The builder can't fold bitextract, so read constants from their bytes.
+    if (auto *C = dyn_cast<Constant>(SrcVal))
+      if (Constant *Res = getConstantValueForLoad(C, Offset, LoadTy, DL))
+        return Res;
     unsigned SrcBits = DL.getTypeSizeInBits(SrcTy).getFixedValue();
     unsigned LoadBits = DL.getTypeSizeInBits(LoadTy).getFixedValue();
-    if (LoadBits == SrcBits)
-      return Builder.CreateBitCast(SrcVal, LoadTy);
+    if (LoadBits == SrcBits) {
+      if (CastInst::castIsValid(Instruction::BitCast, SrcTy, LoadTy))
+        return Builder.CreateBitCast(SrcVal, LoadTy);
+      // Otherwise, one side holds pointers. Convert them to integers lane by
+      // lane, and let coerceAvailableValueToLoadType cast to the load type.
+      if (SrcTy->isPtrOrPtrVectorTy())
+        return Builder.CreatePtrToInt(SrcVal, DL.getIntPtrType(SrcTy));
+      return SrcVal;
+    }
     // bitextract needs a scalar byte source and can't return a vector.
     SrcVal = Builder.CreateBitCast(SrcVal, Type::getByteNTy(Ctx, SrcBits));
     Type *ExtractTy =
