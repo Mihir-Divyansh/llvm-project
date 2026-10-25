@@ -4923,6 +4923,30 @@ Instruction *InstCombinerImpl::visitBitExtractInst(BitExtractInst &BE) {
                                      DL.getTypeSizeInBits(Src->getType()))
     return new BitCastInst(Src, BE.getType());
 
+  // bitextract ty, (bitcast <N x T> X to bM), off
+  //   -> extractelement (bitcast X to <M/W x ty>), off/W
+  // where W is the width of ty and off is a multiple of W. A vector is poisoned
+  // per lane, so lanes outside of the extracted range don't poison the result.
+  // Byte results are left to their bitcast users, which may become shuffles.
+  Type *Ty = BE.getType();
+  Value *X;
+  uint64_t Off;
+  if (match(Src, m_BitCast(m_Value(X))) && isa<FixedVectorType>(X->getType()) &&
+      !X->getType()->isPtrOrPtrVectorTy() &&
+      (Ty->isIntegerTy() || Ty->isIEEELikeFPTy()) &&
+      match(Offset, m_ConstantInt(Off))) {
+    uint64_t SrcBits = DL.getTypeSizeInBits(Src->getType()).getFixedValue();
+    uint64_t W = DL.getTypeSizeInBits(Ty).getFixedValue();
+    if (W % 8 == 0 && SrcBits % W == 0 && Off % W == 0) {
+      uint64_t NumElts = SrcBits / W;
+      uint64_t Idx = Off / W;
+      if (DL.isBigEndian())
+        Idx = NumElts - 1 - Idx;
+      Value *Vec = Builder.CreateBitCast(X, FixedVectorType::get(Ty, NumElts));
+      return ExtractElementInst::Create(Vec, Builder.getInt64(Idx));
+    }
+  }
+
   return nullptr;
 }
 

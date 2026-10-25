@@ -3489,6 +3489,45 @@ static Value *foldCopySignIdioms(BitCastInst &CI,
   return Builder.CreateCopySign(Builder.CreateBitCast(Y, FTy), X);
 }
 
+/// bitcast (bitextract bK, (bitcast <N x T> X to bM), off) to <k x U>
+///   -> shufflevector (bitcast X to <M/W x U>), <off/W, ..., off/W + k - 1>
+/// where W is the width of U and off is a multiple of W. A vector is poisoned
+/// per lane, so lanes outside of the extracted range don't poison the result.
+static Instruction *foldBitCastOfVectorBitExtract(BitCastInst &CI,
+                                                  InstCombinerImpl &IC) {
+  auto *DestTy = dyn_cast<FixedVectorType>(CI.getType());
+  Value *X;
+  uint64_t Off;
+  if (!DestTy || DestTy->isPtrOrPtrVectorTy() ||
+      !match(CI.getOperand(0), m_OneUse(m_BitExtract(m_BitCast(m_Value(X)),
+                                                     m_ConstantInt(Off)))) ||
+      !isa<FixedVectorType>(X->getType()) || X->getType()->isPtrOrPtrVectorTy())
+    return nullptr;
+
+  Type *EltTy = DestTy->getElementType();
+  if (!EltTy->isIntegerTy() && !EltTy->isIEEELikeFPTy() && !EltTy->isByteTy())
+    return nullptr;
+
+  const DataLayout &DL = IC.getDataLayout();
+  uint64_t SrcBits = DL.getTypeSizeInBits(X->getType()).getFixedValue();
+  uint64_t W = DL.getTypeSizeInBits(EltTy).getFixedValue();
+  if (W % 8 != 0 || SrcBits % W != 0 || Off % W != 0)
+    return nullptr;
+
+  uint64_t NumElts = SrcBits / W;
+  uint64_t NumLanes = DestTy->getNumElements();
+  // An out of range offset is poison, which InstSimplify folds.
+  if (Off / W + NumLanes > NumElts)
+    return nullptr;
+  uint64_t First = Off / W;
+  if (DL.isBigEndian())
+    First = NumElts - NumLanes - First;
+  Value *Vec =
+      IC.Builder.CreateBitCast(X, FixedVectorType::get(EltTy, NumElts));
+  auto Mask = llvm::to_vector(llvm::seq<int>(First, First + NumLanes));
+  return new ShuffleVectorInst(Vec, Mask);
+}
+
 Instruction *InstCombinerImpl::visitBitCast(BitCastInst &CI) {
   // If the operands are integer typed then apply the integer transforms,
   // otherwise just apply the common ones.
@@ -3500,6 +3539,9 @@ Instruction *InstCombinerImpl::visitBitCast(BitCastInst &CI) {
   // be replaced by the operand.
   if (DestTy == Src->getType())
     return replaceInstUsesWith(CI, Src);
+
+  if (Instruction *I = foldBitCastOfVectorBitExtract(CI, *this))
+    return I;
 
   if (isa<FixedVectorType>(DestTy)) {
     if (isa<IntegerType>(SrcTy)) {
